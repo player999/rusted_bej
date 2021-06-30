@@ -1,6 +1,6 @@
 use std::convert::{TryFrom};
 use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive};
 use std::io::{Error, ErrorKind};
 
 macro_rules! unwrap_or_return {
@@ -108,7 +108,7 @@ enum BejValue {
     String(String),
     Real(f64),
     Boolean(bool),
-    Bytestring(std::io::Bytes<u8>),
+    Bytestring(Vec<u8>),
     Set(Vec<BejTuple>),
     Array(Vec<BejTuple>),
     Choice(Box<BejTuple>),
@@ -333,23 +333,98 @@ fn parse_bej_set(data: &[u8]) -> Result<BejValue, Error>
     Ok(BejValue::Set(tuples))
 }
 
+fn parse_bej_array(data: &[u8]) -> Result<BejValue, Error>
+{
+    let (s, v) = read_nnint(data).unwrap();
+    let mut offset: usize = s;
+    let mut tuples: Vec<BejTuple> = Vec::new();
+    for _ in 0..v {
+        let (tpl, len) = unwrap_or_return!(create_bej_tuple(&data[offset..]));
+        offset += len;
+        tuples.push(tpl);
+    }
+    Ok(BejValue::Array(tuples))
+}
+
+fn parse_bej_integer(data: &[u8]) -> Result<BejValue, Error> {
+    if data.len() > 8 {
+        Err(Error::new(std::io::ErrorKind::InvalidData, "Could not parse integer"))
+    } else {
+        let mut val: [u8; 8] = [0,0,0,0,0,0,0,0];
+        for ii in 0..data.len() {
+            val[ii] = data[ii];
+        }
+        Ok(BejValue::Integer(i64::from_le_bytes(val)))
+    }
+}
+
+fn parse_bej_enum(data: &[u8]) -> Result<BejValue, Error>
+{
+    let (_, v) = read_nnint(data).unwrap();
+    Ok(BejValue::Enum(v))
+}
+
+fn parse_bej_real(data: &[u8]) -> Result<BejValue, Error>
+{
+    if data.len() > 8 {
+        Err(Error::new(std::io::ErrorKind::InvalidData, "Could not parse real"))
+    } else {
+        let mut val: [u8; 8] = [0,0,0,0,0,0,0,0];
+        for ii in 0..data.len() {
+            val[ii] = data[ii];
+        }
+        Ok(BejValue::Real(f64::from_le_bytes(val)))
+    }
+}
+
+fn parse_bej_bool(data: &[u8]) -> Result<BejValue, Error>
+{
+    if data.len() != 1 {
+        Err(Error::new(std::io::ErrorKind::InvalidData, "Could not parse bool"))
+    } else {
+        Ok(BejValue::Boolean(data[0] > 0))
+    }
+}
+
 fn parse_bej_value(format: BejFormat, data: &[u8]) -> Result<BejValue, Error>
 {
     match format {
         BejFormat::Set => parse_bej_set(data),
-        BejFormat::Array => Err(Error::new(std::io::ErrorKind::InvalidData, "Arrays are not yet supported")),
-        BejFormat::Null => Err(Error::new(std::io::ErrorKind::InvalidData, "Nulls are not yet supported")),
-        BejFormat::Integer => Err(Error::new(std::io::ErrorKind::InvalidData, "Integers are not yet supported")),
-        BejFormat::Enum => Err(Error::new(std::io::ErrorKind::InvalidData, "Enums are not yet supported")),
+        BejFormat::Array => parse_bej_array(data),
+        BejFormat::Null => Ok(BejValue::Null),
+        BejFormat::Integer => parse_bej_integer(data),
+        BejFormat::Enum => parse_bej_enum(data),
         BejFormat::String => parse_bej_string(data),
-        BejFormat::Real => Err(Error::new(std::io::ErrorKind::InvalidData, "Reals are not yet supported")),
-        BejFormat::Boolean => Err(Error::new(std::io::ErrorKind::InvalidData, "Bools are not yet supported")),
-        BejFormat::Bytestring => Err(Error::new(std::io::ErrorKind::InvalidData, "Bytestrings are not yet supported")),
-        BejFormat::Choice => Err(Error::new(std::io::ErrorKind::InvalidData, "Choices are not yet supported")),
-        BejFormat::PropertyAnnotations => Err(Error::new(std::io::ErrorKind::InvalidData, "Property annotations are not yet supported")),
-        BejFormat::RegistryItem => Err(Error::new(std::io::ErrorKind::InvalidData, "Registry items are not yet supported")),
-        BejFormat::ResourceLink => Err(Error::new(std::io::ErrorKind::InvalidData, "Resource Links are not yet supported")),
-        BejFormat::ResourceLinkExpansion => Err(Error::new(std::io::ErrorKind::InvalidData, "Resource link expansions are not yet supported")),
+        BejFormat::Real => parse_bej_real(data),
+        BejFormat::Boolean => parse_bej_bool(data),
+        BejFormat::Bytestring => Ok(BejValue::Bytestring(data.to_vec())),
+        BejFormat::Choice => Ok(BejValue::Choice(Box::new(match create_bej_tuple(data){
+            Ok((t, _)) => t,
+            Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Failed to parse Bej Choice"))
+        }))),
+        BejFormat::PropertyAnnotations => Ok(BejValue::PropertyAnnotation(Box::new(match create_bej_tuple(data){
+            Ok((t, _)) => t,
+            Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Failed to parse Bej Property annotation"))
+        }))),
+        BejFormat::RegistryItem => {
+            match read_nnint(data) {
+                Ok((_, v)) => Ok(BejValue::RegistryItem(v)),
+                Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Failed to parse registry item"))
+            }
+        },
+        BejFormat::ResourceLink => {
+            match read_nnint(data) {
+                Ok((_, v)) => Ok(BejValue::ResourceLink(v)),
+                Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Failed to parse resource link"))
+            }
+        }
+        BejFormat::ResourceLinkExpansion => {
+            let (sz, resource_id) = match read_nnint(data) {
+                Ok(v) => v,
+                Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Failed to parse resource link expansion"))
+            };
+            Ok(BejValue::ResourceLinkExpansion(resource_id, data[sz..].to_vec()))
+        }
     }
 }
 
