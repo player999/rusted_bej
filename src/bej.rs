@@ -1,7 +1,7 @@
 use std::convert::{TryFrom};
 use num_derive::FromPrimitive;
 use num_traits::{FromPrimitive};
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Write};
 
 macro_rules! unwrap_or_return {
     ( $e:expr ) => {
@@ -425,6 +425,56 @@ fn parse_bej_value(format: BejFormat, data: &[u8]) -> Result<BejValue, Error>
             };
             Ok(BejValue::ResourceLinkExpansion(resource_id, data[sz..].to_vec()))
         }
+    }
+}
+
+fn encode_nnint(val: u64, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    let bytearraty = val.to_le_bytes();
+    let res = if val <= 0xFF {
+        buf.write(&[1])
+    } else if val <= 0xFFFF {
+        buf.write(&[2])
+    } else if val <= 0xFFFFFF {
+        buf.write(&[3])
+    } else if val <= 0xFFFFFFFF {
+        buf.write(&[4])
+    } else if val <= 0xFFFFFFFFFF {
+        buf.write(&[5])
+    } else if val <= 0xFFFFFFFFFFFF {
+        buf.write(&[6])
+    } else if val <= 0xFFFFFFFFFFFFFF {
+        buf.write(&[7])
+    } else {
+        buf.write(&[8])
+    };
+
+    if res.is_ok() {
+        let write_size1 = res.unwrap();
+        let res2 = if val <= 0xFF {
+            buf.write(&bytearraty[0..1])
+        } else if val <= 0xFFFF {
+            buf.write(&bytearraty[0..2])
+        } else if val <= 0xFFFFFF {
+            buf.write(&bytearraty[0..3])
+        } else if val <= 0xFFFFFFFF {
+            buf.write(&bytearraty[0..4])
+        } else if val <= 0xFFFFFFFFFF {
+            buf.write(&bytearraty[0..5])
+        } else if val <= 0xFFFFFFFFFFFF {
+            buf.write(&bytearraty[0..6])
+        } else if val <= 0xFFFFFFFFFFFFFF {
+            buf.write(&bytearraty[0..7])
+        } else {
+            buf.write(&bytearraty[0..8])
+        };
+        if res2.is_ok() {
+            Ok(write_size1 + res2.unwrap())
+        } else {
+            res2
+        }
+    } else {
+        res
     }
 }
 
@@ -915,5 +965,23 @@ mod tests {
         let encoding = create_bej_encoding(&example_coded).unwrap();
         let result = encoding.tuple.decode(&dict, vec![0]).unwrap();
         assert_eq!("\"JobCollection\": {\"Description\": \"Alloha\", \"Name\": \"Bitch\"}", result);
+    }
+
+    #[test]
+    fn test_nnint_coding() {
+        let mut buf:Vec<u8> = Vec::new();
+        let wrote_bytes = encode_nnint(255, &mut buf).unwrap();
+        assert_eq!(wrote_bytes, 2);
+        assert_eq!(buf, vec![0x01, 0xFF]);
+
+        buf = Vec::new();
+        let wrote_bytes = encode_nnint(256, &mut buf).unwrap();
+        assert_eq!(wrote_bytes, 3);
+        assert_eq!(buf, vec![0x02, 0x00, 0x01]);
+
+        buf = Vec::new();
+        let wrote_bytes = encode_nnint(0x1122334455667788, &mut buf).unwrap();
+        assert_eq!(wrote_bytes, 9);
+        assert_eq!(buf, vec![0x08, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
     }
 }
