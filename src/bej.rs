@@ -1,6 +1,7 @@
 use std::convert::{TryFrom};
 use num_derive::FromPrimitive;
 use num_traits::{FromPrimitive};
+use num_traits::cast::ToPrimitive;
 use std::io::{Error, ErrorKind, Write};
 
 macro_rules! unwrap_or_return {
@@ -91,8 +92,28 @@ enum BejSchemaClass {
     Event = 1,
     Annotation = 2,
     CollectionMemberType = 3,
-    Error = 4,
+    BejError = 4,
     Registry = 5
+}
+
+impl ToPrimitive for BejSchemaClass {
+    fn to_i64(&self) -> Option<i64> {
+        Some(match self {
+            BejSchemaClass::Major => 0,
+            BejSchemaClass::Event => 1,
+            BejSchemaClass::Annotation => 2,
+            BejSchemaClass::CollectionMemberType => 3,
+            BejSchemaClass::BejError => 4,
+            BejSchemaClass::Registry => 5,
+        })
+    }
+
+    fn to_u64(&self) -> Option<u64> {
+        match self.to_i64() {
+            Some(a) => Some(a as u64),
+            None => None
+        }
+    }
 }
 
 pub struct BejEncoding {
@@ -187,6 +208,9 @@ impl PartialEq for BejFormat {
 
 pub struct BejTuple {
     seqnum: u64,
+    nullable: bool,
+    read_only: bool,
+    deferred_binding: bool,
     value: BejValue
 }
 
@@ -478,17 +502,123 @@ fn encode_nnint(val: u64, buf: &mut Vec<u8>) -> Result<usize, Error>
     }
 }
 
+fn encode_string(val: &String, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    let mut line = val.clone().into_bytes();
+    line.push(0);
+    buf.write(line.as_slice())
+}
+
+fn encode_bej_value(val: &BejValue, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    match val {
+        BejValue::String(a) => encode_string(a, buf),
+        _ => Err(Error::new(std::io::ErrorKind::InvalidData, "Unknown datatype"))
+    }
+}
+
+fn encode_bej_format(val: &BejTuple) -> u8
+{
+    (if val.deferred_binding { 1 } else { 0 }) |
+    (if val.read_only { 2 } else { 0 }) |
+    (if val.nullable { 4 } else { 0 }) | ((match val.value {
+        BejValue::String(_) => 5,
+        BejValue::ResourceLinkExpansion(_, _) => 15,
+        BejValue::ResourceLink(_) => 14,
+        BejValue::RegistryItem(_) => 11,
+        BejValue::PropertyAnnotation(_) => 10,
+        BejValue::Choice(_) => 9,
+        BejValue::Bytestring(_) => 8,
+        BejValue::Boolean(_) => 7,
+        BejValue::Real(_) => 6,
+        BejValue::Integer(_) => 3,
+        BejValue::Enum(_) => 4,
+        BejValue::Array(_) => 1,
+        BejValue::Set(_) => 0,
+        BejValue::Null => 2
+    }) << 4)
+}
+
+fn encode_bej_tuple(val: &BejTuple, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    let res = encode_nnint(val.seqnum, buf);
+    let seqnum_len = match res {
+        Ok(v) => v,
+        Err(e) => return Err(e)
+    };
+    let format = encode_bej_format(val);
+    buf.push(format);
+    let mut tv: Vec<u8> = Vec::new();
+    let res2 = encode_bej_value(&val.value, &mut tv);
+    let value_len = match res2 {
+        Ok(v) => v,
+        Err(e) => return Err(e)
+    };
+    let res3 = encode_nnint(value_len as u64, buf);
+    let tl = match res3 {
+        Ok(v) => v,
+        Err(e) => return Err(e)
+    };
+
+    buf.append(tv.as_mut());
+    Ok(seqnum_len + 1 + tl + value_len)
+}
+
+fn encode_bej_version(val: &BejVersion, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    buf.push(match val.tiny {
+        Some(a) => 0xF0 | a,
+        None => 0x00
+    });
+
+    buf.push(match val.minor {
+        Some(a) => 0xF0 | a,
+        None => 0x00
+    });
+
+    buf.push(match val.medium {
+        Some(a) => 0xF0 | a,
+        None => 0x00
+    });
+
+    buf.push(match val.major {
+        Some(a) => 0xF0 | a,
+        None => 0x00
+    });
+
+    return Ok(4);
+}
+
+fn encode_bej_encoding(val: &BejEncoding, buf: &mut Vec<u8>) -> Result<usize, Error>
+{
+    let len1 = match encode_bej_version(&val.version, buf) {
+        Ok(a) => a,
+        Err(_) => return Err(Error::new(std::io::ErrorKind::InvalidData, "Unable code version"))
+    };
+    buf.push(0);
+    buf.push(0);
+    buf.push(val.class.to_u8().unwrap());
+
+    Ok(match encode_bej_tuple(&val.tuple, buf) {
+        Ok(l) => len1 + 3 + l,
+        Err(e) => return Err(e)
+    } as usize)
+}
+
 pub fn create_bej_tuple(binary: &[u8]) -> Result<(BejTuple, usize), Error>
 {
     let (len, seqnum) = unwrap_or_return!(read_nnint(binary));
     let format = unwrap_or_return!(BejFormat::try_from(binary[len]));
+    let read_only = binary[len] & 0x2 == 0x2;
+    let deferred_binding = binary[len] & 0x1 == 0x1;
+    let nullable = binary[len] & 0x4 == 0x4;
     let (len2, tuple_length) = unwrap_or_return!(read_nnint(&binary[(len+1)..]));
     if tuple_length > 0 {
         let offset = len + len2 + 1;
         let value = unwrap_or_return!(parse_bej_value(format, &binary[offset..offset + tuple_length as usize]));
-        Ok((BejTuple { seqnum, value}, tuple_length as usize + len + len2 + 1))
+        Ok((BejTuple { seqnum, nullable, read_only, deferred_binding, value}, tuple_length as usize + len + len2 + 1))
     } else {
-        Ok((BejTuple { seqnum, value: BejValue::Null}, tuple_length as usize + len + len2 + 1))
+        Ok((BejTuple { seqnum, nullable, read_only, deferred_binding, value: BejValue::Null}, tuple_length as usize + len + len2 + 1))
     }
 }
 
@@ -983,5 +1113,61 @@ mod tests {
         let wrote_bytes = encode_nnint(0x1122334455667788, &mut buf).unwrap();
         assert_eq!(wrote_bytes, 9);
         assert_eq!(buf, vec![0x08, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn test_encode_string() {
+        let mut buf:Vec<u8> = Vec::new();
+        let sz = encode_string(&String::from("Taras"), &mut buf).unwrap();
+        assert_eq!(sz, 6);
+
+        buf = Vec::new();
+        let sz = encode_bej_value(&BejValue::String(String::from("Taras")), &mut buf).unwrap();
+        assert_eq!(sz, 6);
+    }
+
+    #[test]
+    fn test_tuple_bej_format() {
+        assert_eq!(encode_bej_format(&BejTuple {seqnum: 0, nullable: true, read_only: true, deferred_binding: true, value: BejValue::Null}), 0x27);
+        assert_eq!(encode_bej_format(&BejTuple {seqnum: 0, nullable: true, read_only: false, deferred_binding: true, value: BejValue::Integer(2)}), 0x35);
+    }
+
+    #[test]
+    fn test_encode_tuple() {
+        let mut buf:Vec<u8> = Vec::new();
+        let len = encode_bej_tuple(&BejTuple {seqnum: 0, nullable: true, read_only: false, deferred_binding: true, value: BejValue::String(String::from("Taras"))}, &mut buf).unwrap();
+        assert_eq!(buf, vec![1, 0, 0x55, 0x1, 0x6, 'T' as u8, 'a' as u8, 'r' as u8, 'a' as u8, 's' as u8, 0 ]);
+        assert_eq!(len, 11);
+    }
+
+    #[test]
+    fn test_encode_version() {
+        let mut buf:Vec<u8> = Vec::new();
+        let l = encode_bej_version(&BejVersion {major: Some(1), medium: Some(0), minor: Some(1), tiny: None}, &mut buf).unwrap();
+        assert_eq!(l, 4);
+        assert_eq!(buf, vec![0x00, 0xF1, 0xF0, 0xF1]);
+    }
+
+    #[test]
+    fn test_encode_encoding() {
+        let mut buf:Vec<u8> = Vec::new();
+        let enc = BejEncoding {
+            version: BejVersion {
+                major: Some(1),
+                medium: Some(0),
+                minor: Some(1),
+                tiny: None
+            },
+            class: BejSchemaClass::Event,
+            tuple: BejTuple {
+                seqnum: 0,
+                nullable: true,
+                read_only: false,
+                deferred_binding: true,
+                value: BejValue::String(String::from("Taras"))}
+        };
+        let l = encode_bej_encoding(&enc, &mut buf).unwrap();
+        assert_eq!(l, 18);
+        assert_eq!(buf, vec![0x00, 0xF1, 0xF0, 0xF1, 0x00, 0x00, 0x01, 1, 0, 0x55, 0x1, 0x6, 'T' as u8, 'a' as u8, 'r' as u8, 'a' as u8, 's' as u8, 0 ])
     }
 }
